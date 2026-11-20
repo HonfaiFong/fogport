@@ -39,7 +39,7 @@
 
 1. **HTTP Worker**：处理全部 REST API、本地 PG 事务、签发 RustFS 预签名链接与 WS 票据。
 2. **WebSocket Worker**：校验一次性 WS Ticket（`GETDEL` 阅后即焚），维护 `user_id -> connections` 映射，订阅 Redis Pub/Sub 通道将实时帧推给在线客户端。
-3. **Redis Queue Consumer**：异步执行离线 Push、三方内容安全机审、废弃媒体清理。
+3. **队列消费进程池**（双池隔离，详见 2.4）：`consumer_fast` 消费 `push-high` 做离线 Push；`consumer_slow` 消费 `moderation-normal` / `cleanup-low` 做三方内容机审与废弃媒体清理。
 4. **Crontab 定时进程**：每小时修剪 Redis 捞罐池长度（每海仅保留最新 5000 条）、清理超时闪聊等待节点。
 5. **Monitor 文件监控进程**：开发期检测代码变更并热重载，生产环境不启用文件监控。
 
@@ -47,12 +47,13 @@
 
 同时安装 `ext-event` 与 `ext-swoole`，在 `config/process.php` 中**按进程粒度**指定 `eventLoop`，而非全局统一。
 
-| 进程 | 事件循环 | 理由 |
+| 进程 | 事件循环 | 职责与理由 |
 | --- | --- | --- |
 | `webman`（HTTP CRUD） | `Workerman\Events\Event` | libevent（C 扩展），无协程调度开销，日常高频 CRUD 最稳健 |
 | `websocket`（WS 长连接） | `Workerman\Events\Event` | libevent 支持大 fd 集，适合海量并发连接 |
+| `consumer_fast`（4 进程） | `Workerman\Events\Event` | 消费 `push-high`，离线推送要求秒级送达；推送是无阻塞 HTTP 调用，Event 更轻 |
+| `consumer_slow`（2 进程） | `Workerman\Events\Swoole` | 消费 `moderation-normal` / `cleanup-low`，有外部慢 I/O，需 `SWOOLE_HOOK_ALL` 协程化 |
 | `crontab` / `monitor` | `Workerman\Events\Event` | 轻量定时 / 文件扫描，无需协程 |
-| `task`（慢 I/O 队列消费） | `Workerman\Events\Swoole` | `SWOOLE_HOOK_ALL` 自动协程化阻塞的 curl/PDO/文件 IO，慢任务不占满 Worker |
 
 **实现依据**：`Workerman\Worker::$eventLoop` 是**进程级**属性，webman 的 `worker_start()` 会把 `config/process.php` 中的 `eventLoop` 字段透传给对应 Worker 实例，因此同一代码库内可让不同进程混用两种事件循环。
 
@@ -61,7 +62,26 @@
 1. `event.so` 依赖 `sockets` 扩展导出的 `socket_ce` 符号，其 ini 必须排在 `sockets` 之后加载（Dockerfile 中用 `--ini-name zz-event.ini` 保证），否则启动报 `undefined symbol: socket_ce`。`conf.d` 按文件名排序加载，默认 `docker-php-ext-event.ini` 会排在 `docker-php-ext-sockets.ini` 之前，因此必须显式改名。
 2. 不得 purge `libevent-dev`：`event.so` 运行时动态链接 `libevent_openssl` / `libevent_extra`，删除开发包会连带删除运行时库，导致加载失败。
 3. `swoole` 的 `swoole-curl` 组件在编译期需要 `libcurl4-openssl-dev` 与 `libssl-dev`。
-4. `webman/redis-queue` 插件自带的 `consumer` 进程必须设为 `enable => false`，队列消费统一由 `task` 进程承担，避免两批消费者争抢同一队列且事件循环驱动不一致。
+4. `webman/redis-queue` 插件自带的 `consumer` 进程必须设为 `enable => false`（见 `config/plugin/webman/redis-queue/process.php`），队列消费统一由 `consumer_fast` / `consumer_slow` 双池承担，避免两批消费者争抢同一队列且事件循环驱动不一致。
+5. **本项目禁用 Session**：`config/bootstrap.php` 刻意不注册 `support\bootstrap\Session`，`config/session.php` 已删除。登录态一律由 JWT（AccessToken + RefreshToken）承载，**严禁使用** `$request->session()` 存储验证码或登录态。
+
+### 2.4 队列双层隔离策略（防队头阻塞）
+
+慢 I/O 与高时效性任务必须做**两层隔离**，只拆队列名是不够的：
+
+1. **队列名拆分**：`push-high`（离线推送）/ `moderation-normal`（内容机审）/ `cleanup-low`（媒体清理）。
+2. **进程池拆分**：通过 `webman/redis-queue` 的 `consumer_dir` 构造参数，让两组消费进程**各扫各自目录**，实现物理隔离。
+
+若仅拆队列名而共用同一进程池，三方审核接口超时仍会占满 Worker，直接堵死推送。
+
+**实现要点**（已实测验证）：`Webman\RedisQueue\Process\Consumer` 用 `RecursiveDirectoryIterator` 扫描 `consumer_dir`，只加载该目录下的消费者类，因此 `app/queue/redis/fast` 与 `app/queue/redis/slow` 相互不可见，是真正的进程级隔离，而非逻辑约定。
+
+| 进程池 | consumer_dir | 事件循环 | 队列 | 设计意图 |
+| --- | --- | --- | --- | --- |
+| `consumer_fast` | `app/queue/redis/fast` | Event | `push-high` | 独立进程保障推送秒级送达 |
+| `consumer_slow` | `app/queue/redis/slow` | Swoole | `moderation-normal`、`cleanup-low` | 外部慢 I/O 协程化，超时不影响推送 |
+
+**消费者类约定**：保持极薄，仅做反序列化并委托给对应 Module 的 Service，禁止在消费者内写业务逻辑；投递端 `Client::send('push-high', ...)` 的队列名必须与 `$queue` 属性严格一致。
 
 ---
 
@@ -73,49 +93,69 @@
 fogport/
 ├── config/
 │   ├── database.php             # PostgreSQL 连接配置
+│   ├── redis.php                # 业务 Redis 连接（default 加 fogport: 前缀；pubsub 不加前缀）
 │   ├── storage.php              # RustFS (S3) Endpoint / Bucket / CDN 域名配置
 │   ├── push.php                 # APNs / FCM / 各安卓厂商通道配置（待建）
-│   ├── process.php              # HTTP + WebSocket + RedisQueue + Crontab 进程声明与事件循环分派
+│   ├── process.php              # 进程声明与事件循环分派（含队列双进程池）
 │   ├── event.php                # 模块间解耦事件监听注册
-│   ├── bootstrap.php            # 启动引导注册（含 Database 引导）
+│   ├── bootstrap.php            # 启动引导注册（含 Database 引导，**不注册 Session**）
+│   ├── exception.php            # 全局异常处理器注册
+│   ├── static.php               # 静态文件服务配置（本项目 enable => false）
 │   ├── route.php                # 聚合加载各模块路由
 │   └── plugin/webman/
-│       └── redis-queue/redis.php # Redis 7 连接配置（由插件提供，勿另建 config/redis.php）
+│       └── redis-queue/redis.php # 队列插件专用连接（fogport: 前缀）
 ├── app/
 │   ├── bootstrap/
 │   │   └── Database.php         # 注册 Capsule：查询构造器 / Eloquent / DB Facade
-│   ├── command/                 # webman 命令行命令（migrate / migrate:rollback / migrate:status）
+│   ├── command/                 # CLI：migrate / migrate:rollback / migrate:status
+│   ├── exception/               # BusinessException / ErrorCode / 全局 Handler（统一 7.1 响应格式）
+│   ├── middleware/              # TraceId / TrustedProxyIp / Auth / RateLimit（禁写业务逻辑）
 │   ├── model/
-│   │   └── Model.php            # Eloquent 基类（UUIDv7 主键约定）
-│   ├── process/                 # 自定义进程：Websocket / Crontab
-│   ├── queue/redis/             # 异步队列消费入口（薄壳，调用对应 Module Service）
-│   ├── support/                 # 通用工具（UuidV7 等）
-│   ├── Shared/                  # 纯技术基础设施（禁止写业务逻辑）
-│   │   ├── Exception/           # BusinessException、统一 ErrorCode、全局异常处理器
-│   │   ├── Middleware/          # TraceId、TrustedProxyIp、AuthMiddleware、RateLimitMiddleware
-│   │   ├── Support/             # DbTransaction、ApiResponse、HmacSigner
-│   │   ├── Storage/             # RustFsSigner（生成直传 Presigned URL 与访问 URL）
-│   │   └── Realtime/            # RealtimePusher（向 Redis Pub/Sub 发布推送指令）
-│   └── Modules/
+│   │   └── Model.php            # 唯一 Eloquent 基类（UUIDv7 主键约定），禁止放具体业务表模型
+│   ├── process/                 # 自定义进程：Http / Websocket / Crontab / Monitor
+│   ├── queue/redis/             # 异步队列消费入口（薄壳，仅反序列化并委托 Module Service）
+│   │   ├── fast/
+│   │   │   └── PushConsumer.php        # 队列 push-high（离线推送，秒级送达）
+│   │   └── slow/
+│   │       ├── ModerationConsumer.php  # 队列 moderation-normal（三方内容机审）
+│   │       └── CleanupConsumer.php     # 队列 cleanup-low（RustFS 媒体清理）
+│   ├── support/                 # 全局纯技术基础设施（禁止写业务逻辑）
+│   │   ├── UuidV7.php           # UUIDv7 生成
+│   │   ├── ApiResponse.php      # 统一响应封装（待建）
+│   │   ├── HmacSigner.php       # 签名工具（待建）
+│   │   ├── Storage/             # RustFsSigner：生成直传 Presigned URL 与访问 URL（待建）
+│   │   └── Realtime/            # RealtimePusher：向 Redis Pub/Sub 发布推送指令（待建）
+│   └── Modules/                 # 业务域（跨模块只能经 Facade + webman/event）
 │       ├── Identity/            # [模块1] 登录认证、真身资料、分身卡、WS票据、出口脱敏 Presenter
 │       ├── Safety/              # [模块2] 双向拉黑、敏感词初筛、举报与众包 Shadowban、多维封禁
 │       ├── Can/                 # [模块3] 情绪之海、罐头/评论 CRUD、单帖匿名映射、捞罐算法、媒体直传
 │       ├── Chat/                # [模块4] 私聊会话、seq 增量同步、亮真身状态机、闪聊撮合、WS 处理器
-│       └── Notification/        # [模块5] 站内通知、PushChannelInterface 及各厂商推送适配器
+│       ├── Notification/        # [模块5] 站内通知、PushChannelInterface 及各厂商推送适配器
+│       └── Admin/               # [模块6] 人工复核 Shadowban 队列、确认封号与解封、内容恢复
 ├── database/
 │   ├── migrations/              # Phinx 迁移文件（PHP，非 SQL）
 │   └── seeds/                   # 种子数据
 ├── docker/php/                  # PHP 镜像定义（Dockerfile / php.ini）
+├── docs/specs/                  # 按模块拆分的详细设计文档（后续填充）
 ├── tests/
+│   ├── bootstrap.php            # PHPUnit 引导（仅 autoload + .env，不启动内核）
 │   ├── Unit/                    # 重点覆盖：AuthorPresenter 防掉马断言、捞罐算分、敏感词
 │   └── Feature/                 # 重点覆盖：端到端核心业务闭环测试
 ├── compose.yaml                 # 本地开发环境：app + postgres:16 + redis:7（RustFS 由独立设备提供）
 ├── phinx.php                    # Phinx 迁移配置（连接参数复用 .env）
+├── phpunit.xml                  # PHPUnit 配置（Unit / Feature 两个测试套件）
 ├── webman                       # webman 命令行入口
 ├── PROJECT_SPEC.md              # 本文档
 └── composer.json
 
 ```
+
+### 3.1.1 目录铁律（AI 与人工都必须遵守）
+
+1. **禁止新建 `app/Shared/`**：该目录已废弃并删除。全局纯技术基础设施统一放 webman 默认目录 —— `app/support`（工具类）、`app/middleware`（中间件）、`app/exception`（异常与错误码）、`app/model`（唯一 Eloquent 基类）。
+2. **业务代码只能放 `app/Modules/{Module}/`**：按模块划分 Controller / Service / Model / Presenter / Facade / DTO。
+3. **两个 Redis 配置缺一不可**：`config/redis.php` 供业务代码使用（ZSET 捞罐池、去重 Set、WS 票据、限流、Pub/Sub）；`config/plugin/webman/redis-queue/redis.php` 仅供队列插件使用。二者不可互相替代或合并。
+4. **`app/model/` 下只允许存在 `Model.php`**，具体业务表模型一律放各自模块的 `Model/` 子目录。
 
 ### 3.2 模块单向依赖矩阵（严禁循环依赖）
 
