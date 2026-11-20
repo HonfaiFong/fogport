@@ -11,7 +11,7 @@ use Workerman\Timer;
  * 建立流程（后续在此实现）：
  * 1. 客户端先调 POST /v1/ws/ticket 取得 30 秒一次性票据 nonce；
  * 2. 连接 ws://host:8788?ticket={nonce}，此处用 GETDEL 原子消费票据防重放；
- * 3. 维护 user_id -> connections 映射，订阅 Redis Pub/Sub（yg:ws:bus）转发实时帧；
+ * 3. 维护 user_id -> connections 映射，订阅 Redis Pub/Sub（fogport:ws:bus）转发实时帧；
  * 4. 心跳：25 秒间隔，10 秒内无心跳则断开。
  */
 class Websocket

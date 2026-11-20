@@ -2,7 +2,7 @@
 
 /**
  * Redis 7 连接配置（供 webman/redis-queue 与业务缓存使用）。
- * 所有业务 Key 必须带统一前缀 yg:，见 PROJECT_SPEC.md 第 6 节。
+ * 所有业务 Key 必须带统一前缀 fogport:，见 PROJECT_SPEC.md 第 6 节。
  */
 return [
     'default' => [
@@ -10,7 +10,7 @@ return [
         'options' => [
             'auth' => env('REDIS_PASSWORD', '') ?: null,
             'db' => (int) env('REDIS_DB', 0),
-            'prefix' => env('REDIS_PREFIX', 'yg:'),
+            'prefix' => env('REDIS_PREFIX', 'fogport:'),
             'max_attempts' => 5,
             'retry_seconds' => 5,
         ],

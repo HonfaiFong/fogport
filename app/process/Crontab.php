@@ -8,8 +8,8 @@ use Workerman\Crontab\Crontab as WorkermanCrontab;
  * 定时任务进程骨架。
  *
  * 计划任务（后续在此实现）：
- * - 每小时：修剪 Redis 捞罐池 yg:sea:pool:{sea_id}，每个情绪海仅保留最新 5000 条；
- * - 每分钟：清理闪聊队列 yg:flash:queue:{tag} 中超时（>30s）的等待节点。
+ * - 每小时：修剪 Redis 捞罐池 fogport:sea:pool:{sea_id}，每个情绪海仅保留最新 5000 条；
+ * - 每分钟：清理闪聊队列 fogport:flash:queue:{tag} 中超时（>30s）的等待节点。
  */
 class Crontab
 {
