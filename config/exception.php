@@ -1,17 +1,10 @@
 <?php
 /**
- * This file is part of webman.
+ * 全局异常处理器注册。
  *
- * Licensed under The MIT License
- * For full copyright and license information, please see the MIT-LICENSE.txt
- * Redistributions of files must retain the above copyright notice.
- *
- * @author    walkor<walkor@workerman.net>
- * @copyright walkor<walkor@workerman.net>
- * @link      http://www.workerman.net/
- * @license   http://www.opensource.org/licenses/mit-license.php MIT License
+ * 空字符串键表示全局默认处理器，负责把所有异常收敛为
+ * PROJECT_SPEC.md 7.1 约定的统一 JSON 响应格式。
  */
-
 return [
-    '' => support\exception\Handler::class,
+    '' => app\exception\Handler::class,
 ];

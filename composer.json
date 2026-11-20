@@ -37,7 +37,9 @@
     "phpoption/phpoption": "^1.9",
     "vlucas/phpdotenv": "^5.6",
     "symfony/console": "^7.0",
-    "robmorgan/phinx": "^0.16"
+    "robmorgan/phinx": "^0.16",
+    "webman/redis": "^2.1",
+    "illuminate/redis": "^11.51"
   },
   "suggest": {
     "ext-event": "For better performance. "
@@ -46,11 +48,18 @@
     "psr-4": {
       "": "./",
       "app\\": "./app",
-      "App\\": "./app",
-      "app\\View\\Components\\": "./app/view/components"
+      "App\\": "./app"
+    }
+  },
+  "autoload-dev": {
+    "psr-4": {
+      "tests\\": "./tests"
     }
   },
   "scripts": {
+    "test": "phpunit",
+    "test:unit": "phpunit --testsuite Unit",
+    "test:feature": "phpunit --testsuite Feature",
     "post-package-install": [
       "support\\Plugin::install"
     ],
@@ -70,6 +79,7 @@
   "minimum-stability": "dev",
   "prefer-stable": true,
   "require-dev": {
-    "webman/console": "^2.0"
+    "webman/console": "^2.0",
+    "phpunit/phpunit": "^11.0"
   }
 }

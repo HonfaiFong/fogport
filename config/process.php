@@ -1,11 +1,15 @@
 <?php
 /**
- * 进程声明：HTTP + WebSocket + RedisQueue + Crontab
+ * 进程声明：HTTP + WebSocket + 双优先级队列消费池 + Crontab + Monitor
  *
  * 事件循环分派策略（核心）：
  * - 全局默认使用 Event 驱动（libevent，C 扩展，无协程开销），承载日常高频 CRUD 的 HTTP/WS 服务，稳健高效。
- * - 仅"慢 I/O"进程（第三方 AI 接口、消息推送、异步队列消费）单独设为 Swoole 驱动，
- *   以便利用 SWOOLE_HOOK_ALL 把阻塞式 curl/PDO/文件 IO 自动协程化，不阻塞 Worker。
+ * - 慢 I/O 进程单独设为 Swoole 驱动，利用 SWOOLE_HOOK_ALL 把阻塞式 curl/PDO/文件 IO 自动协程化。
+ *
+ * 队列隔离策略（防队头阻塞）：
+ * - consumer_fast：push-high，离线推送，要求秒级送达，Event 驱动
+ * - consumer_slow：moderation-normal / cleanup-low，外部慢 I/O，Swoole 驱动 + 独立进程池
+ *   两层隔离（队列名 + 进程池）确保机审超时不会拖垮推送。
  *
  * 注意：Worker 的 eventLoop 是进程级属性，webman 的 worker_start() 会透传本文件的 eventLoop 字段，
  * 因此同一套代码库内可以按进程混用两种事件循环。
@@ -48,13 +52,25 @@ return [
         'context' => [],
     ],
 
-    // 异步任务队列：慢 I/O 集中于此，使用 Swoole 驱动获得协程化阻塞调用
-    'task' => [
+    // 高时效性推送队列：离线 Push 要求秒级送达，独立进程池 + Event 驱动。
+    // 推送本身是无阻塞的 HTTP 调用且量级可控，不需要协程化，用 Event 更轻。
+    'consumer_fast' => [
         'handler' => Webman\RedisQueue\Process\Consumer::class,
         'count' => 4,
+        'eventLoop' => Event::class,
+        'constructor' => [
+            'consumer_dir' => base_path() . '/app/queue/redis/fast'
+        ]
+    ],
+
+    // 慢 I/O 队列：三方内容机审、RustFS 媒体清理，独立进程池 + Swoole 驱动，
+    // 利用 SWOOLE_HOOK_ALL 协程化阻塞调用，超时也不影响上面的推送池。
+    'consumer_slow' => [
+        'handler' => Webman\RedisQueue\Process\Consumer::class,
+        'count' => 2,
         'eventLoop' => Swoole::class,
         'constructor' => [
-            'consumer_dir' => base_path() . '/app/queue/redis'
+            'consumer_dir' => base_path() . '/app/queue/redis/slow'
         ]
     ],
 
