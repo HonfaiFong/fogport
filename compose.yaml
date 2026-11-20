@@ -1,0 +1,80 @@
+name: fogport
+
+services:
+  app:
+    build:
+      context: ./docker/php
+      dockerfile: Dockerfile
+    image: fogport-php:8.3
+    container_name: fogport-app
+    working_dir: /app
+    volumes:
+      - ./:/app
+      - composer-cache:/root/.composer/cache
+    environment:
+      TZ: Asia/Shanghai
+    ports:
+      - "${APP_HTTP_PORT:-8787}:8787"
+      - "${APP_WS_PORT:-8788}:8788"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    # 常驻内存进程：用 stop 信号优雅退出，避免 RPC 残留
+    stop_signal: SIGTERM
+    stop_grace_period: 10s
+    networks:
+      - fogport
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: fogport-postgres
+    environment:
+      POSTGRES_DB: "${DB_DATABASE:-fogport}"
+      POSTGRES_USER: "${DB_USERNAME:-fogport}"
+      POSTGRES_PASSWORD: "${DB_PASSWORD:-fogport_dev_pwd}"
+      # UUIDv7 由应用层生成，数据库仅提供 uuid 类型与 JSONB
+      TZ: Asia/Shanghai
+    ports:
+      - "${DB_HOST_PORT:-15432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME:-fogport} -d ${DB_DATABASE:-fogport}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - fogport
+
+  redis:
+    image: redis:7-alpine
+    container_name: fogport-redis
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:-fogport_dev_pwd}"]
+    environment:
+      TZ: Asia/Shanghai
+    ports:
+      - "${REDIS_HOST_PORT:-16379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-fogport_dev_pwd}", "--no-auth-warning", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - fogport
+
+# 说明：对象存储（RustFS，S3 兼容）由独立设备提供，不在本地 compose 中启动。
+# 应用通过 .env 中的 RUSTFS_* 变量连接远端地址，见 config/storage.php。
+
+volumes:
+  postgres-data:
+  redis-data:
+  composer-cache:
+
+networks:
+  fogport:
+    driver: bridge

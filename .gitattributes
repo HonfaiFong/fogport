@@ -1,0 +1,24 @@
+# 统一换行符：仓库内一律 LF，避免 Windows 开发 + Linux 容器部署时出现
+# shell 脚本 / Dockerfile CRLF 导致的 "bad interpreter" 或命令解析失败。
+* text=auto eol=lf
+
+# 明确二进制文件，防止被误转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.zip binary
+*.phar binary
+
+# Windows 批处理必须保持 CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 配置文件按文本处理
+*.md text
+*.php text
+*.json text
+*.yaml text
+*.yml text
+*.ini text
